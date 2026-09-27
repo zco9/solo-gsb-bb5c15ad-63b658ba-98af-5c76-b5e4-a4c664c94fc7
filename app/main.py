@@ -21,6 +21,9 @@ from .schemas import (
     LoggerBindingUpdate,
     LoggerConsistencyResponse,
     LoggerCreate,
+    LoggerInvalidPeriodIn,
+    LoggerInvalidPeriodOut,
+    LoggerInvalidPeriodUpdate,
     LoggerOut,
     LoggerReadingOut,
     LoggerReadingsResponse,
@@ -51,6 +54,8 @@ app = FastAPI(
         "支持共享温度记录仪：登记记录仪与读数，并以左闭右开时段绑定到样本，"
         "记录仪读数按发生时间归入绑定窗口内的样本（一读多样本），"
         "与样本直接读数一起重算冻融循环、暴露剂量与告警。"
+        "记录仪可登记校准无效时段（左闭右开、互不重叠）：时段内读数照常入库可查，"
+        "但不归属样本、不参与冻融/剂量/告警与一致性核查，时段删除后有效读数恢复归属。"
         "另提供样本 × 记录仪温度一致性核查：对样本直接读数与当前归属的记录仪读数"
         "做不交叉一对一最优配对（配对数最多、总时间差最小、读数 ID 序列稳定取舍），"
         "返回温差超限配对明细与配对/未配对数量。"
@@ -467,6 +472,85 @@ def update_binding(
 def delete_binding(binding_id: int, conn=Depends(services.get_db_connection)):
     if not services.delete_binding(conn, binding_id):
         raise HTTPException(status_code=404, detail="绑定不存在")
+
+
+# ---------------- 记录仪校准无效时段 ----------------
+
+
+@app.post(
+    "/loggers/{logger_id}/invalid-periods",
+    response_model=LoggerInvalidPeriodOut,
+    status_code=201,
+    tags=["loggers"],
+)
+def create_invalid_period(
+    logger_id: str,
+    payload: LoggerInvalidPeriodIn,
+    conn=Depends(services.get_db_connection),
+):
+    """登记校准无效时段（左闭右开；同一记录仪时段不重叠）。
+
+    落在时段内的记录仪读数仍照常幂等入库、可经原始读数接口查询，
+    但不归属样本，不参与冻融循环、暴露剂量、告警与一致性核查；
+    登记后自动对绑定该记录仪的样本重新对账并回算。
+    """
+
+    _require_logger(conn, logger_id)
+    try:
+        return services.create_invalid_period(
+            conn, logger_id, payload.start_time, payload.end_time
+        )
+    except services.ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.get(
+    "/loggers/{logger_id}/invalid-periods",
+    response_model=list[LoggerInvalidPeriodOut],
+    tags=["loggers"],
+)
+def list_invalid_periods(logger_id: str, conn=Depends(services.get_db_connection)):
+    _require_logger(conn, logger_id)
+    return services.list_invalid_periods(conn, logger_id)
+
+
+@app.get(
+    "/invalid-periods/{period_id}",
+    response_model=LoggerInvalidPeriodOut,
+    tags=["loggers"],
+)
+def get_invalid_period(period_id: int, conn=Depends(services.get_db_connection)):
+    period = services.get_invalid_period(conn, period_id)
+    if period is None:
+        raise HTTPException(status_code=404, detail="校准无效时段不存在")
+    return period
+
+
+@app.patch(
+    "/invalid-periods/{period_id}",
+    response_model=LoggerInvalidPeriodOut,
+    tags=["loggers"],
+)
+def update_invalid_period(
+    period_id: int,
+    payload: LoggerInvalidPeriodUpdate,
+    conn=Depends(services.get_db_connection),
+):
+    if services.get_invalid_period(conn, period_id) is None:
+        raise HTTPException(status_code=404, detail="校准无效时段不存在")
+    changes = payload.model_dump(exclude_unset=True)
+    try:
+        return services.update_invalid_period(conn, period_id, changes)
+    except services.ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.delete("/invalid-periods/{period_id}", status_code=204, tags=["loggers"])
+def delete_invalid_period(period_id: int, conn=Depends(services.get_db_connection)):
+    """删除校准无效时段：原时段内的有效读数恢复归属，受影响样本自动回算。"""
+
+    if not services.delete_invalid_period(conn, period_id):
+        raise HTTPException(status_code=404, detail="校准无效时段不存在")
 
 
 # ---------------- 样本 × 记录仪温度一致性核查 ----------------

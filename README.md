@@ -13,6 +13,10 @@
   **左闭右开时段**；记录仪读数仅归入发生时间落在绑定时段内的样本（同一读数可归入多个样本），
   与样本直接读数合并到同一条时间轴上重算冻融循环、剂量与告警；迟到读数或绑定时段变更会
   撤销旧归属并重建受影响样本；
+- 支持**记录仪校准无效时段**：按左闭右开时段登记（同一记录仪互不重叠），时段内的记录仪读数
+  照常幂等入库、可经原始读数接口查询，但不归属样本，也不参与冻融循环、暴露剂量、告警与
+  温度一致性核查；时段增删改或迟到读数到达后自动对受影响样本重新对账回算，
+  删除时段后有效读数恢复归属；
 - 提供**样本 × 记录仪温度一致性核查**：取样本直接读数与当前有效归属的该记录仪读数，
   按事件时间顺序做**不交叉一对一配对**（配对数最多 → 总时间差最小 → 读数 ID 序列稳定取舍），
   返回温差严格大于阈值的配对明细与配对 / 两侧未配对数量；只读查询，不改写任何既有结果；
@@ -152,6 +156,31 @@ PATCH 样本的阈值、允许区间、循环上限、剂量预算或最大可�
   为直接读数与记录仪归属读数合并后的时间轴（返回项带 `source`、`logger_id`、`logger_reading_id`）；
 - `GET /samples/{id}/state` 的最近读数/循环/剂量同样基于合并时间轴。
 
+## 记录仪校准无效时段
+
+记录仪送校 / 故障 / 维护期间产生的读数不可信，可登记**校准无效时段**将其排除出样本归属：
+
+1. `POST /loggers/{id}/invalid-periods` 登记**左闭右开 `[start_time, end_time)`** 时段
+   （`start_time` 必须严格早于 `end_time`）；**同一记录仪**的时段不得重叠
+   （端点相接合法），重叠提交返回 422；
+2. 落在无效时段内的记录仪读数**仍照常幂等入库**（`event_id` / 同时刻同温度判重规则不变），
+   并可通过 `GET /loggers/{id}/readings` 查询原始数据；
+3. 但这些读数**不归属任何样本**——对账时一律跳过，因此不参与合并时间轴上的
+   冻融循环识别、暴露剂量积分、告警推导与样本 × 记录仪温度一致性核查
+   （一致性核查的“当前有效归属”自然不含它们）；
+4. 新增、`PATCH`、删除时段或补入迟到读数后，服务对所有绑定该记录仪的样本
+   **重新对账归属并整体回算**：循环 / 剂量 / 告警随之可逆更新，
+   直接读数与既有告警确认状态按现有规则（稳定去重键 upsert）保留；
+5. **删除时段后**，原时段内的有效读数恢复归属并重新参与上述推导；
+   删除记录仪会级联清理其全部无效时段。
+
+查询：
+
+- `GET /loggers/{id}/invalid-periods`：该记录仪的无效时段列表
+  （`reading_count` 为当前落在时段内、被排除归属的原始读数条数）；
+- `GET /invalid-periods/{id}`：单条时段详情；
+- `PATCH/DELETE /invalid-periods/{id}`：修改 / 删除时段（自动对账回算受影响样本）。
+
 ## 样本 × 记录仪温度一致性核查
 
 `GET /samples/{sample_id}/logger-consistency/{logger_id}?max_time_diff_seconds=300&temp_diff_threshold_c=2.0`
@@ -219,6 +248,8 @@ curl 'http://localhost:8000/samples/sample-demo-001/logger-consistency/logger-tr
 | POST/GET | `/samples/{id}/logger-bindings?logger_id=...` | 设置记录仪左闭右开绑定时段 / 样本绑定列表（同时段不重叠） |
 | GET | `/loggers/{id}/bindings` | 该记录仪对各样本的绑定列表 |
 | PATCH/DELETE | `/logger-bindings/{id}` | 修改 / 删除绑定时段（撤销旧归属、重建并重算样本） |
+| POST/GET | `/loggers/{id}/invalid-periods` | 登记 / 查询记录仪**校准无效时段**（左闭右开；同一记录仪不重叠；时段内读数入库但不归属、不参与推导） |
+| GET/PATCH/DELETE | `/invalid-periods/{id}` | 时段详情 / 修改 / 删除（自动对账回算受影响样本；删除后有效读数恢复归属） |
 | GET | `/samples/{id}/logger-consistency/{logger_id}?max_time_diff_seconds=...&temp_diff_threshold_c=...` | **温度一致性核查**：直接读数与当前归属记录仪读数不交叉一对一最优配对，返回温差超限配对明细与配对/未配对数量（只读） |
 | GET | `/samples/{id}/state` | **当前状态**、循环次数、双向暴露剂量/缺口/预算使用率、未确认告警数、最近读数 |
 | GET | `/samples/{id}/cycles` | **完整冻融循环明细** |
@@ -320,6 +351,17 @@ curl -X POST http://localhost:8000/loggers/logger-truck-07/readings \
 # 6. 温度一致性核查：样本直接读数 vs 当前归属的记录仪读数
 #    （最大时间差 300 秒、温差阈值 2°C；只读，不影响冻融/剂量/告警）
 curl 'http://localhost:8000/samples/sample-demo-001/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0'
+
+# 7. 校准无效时段：09:30–10:00 记录仪送校，时段内读数不归属样本（原始读数仍入库可查）
+curl -X POST http://localhost:8000/loggers/logger-truck-07/invalid-periods \
+  -H 'Content-Type: application/json' \
+  -d '{"start_time": "2026-09-20T09:30:00Z", "end_time": "2026-09-20T10:00:00Z"}'
+
+# 8. 查询 / 修改 / 删除无效时段（删除后有效读数恢复归属，受影响样本自动回算）
+curl http://localhost:8000/loggers/logger-truck-07/invalid-periods
+curl -X PATCH http://localhost:8000/invalid-periods/1 \
+  -H 'Content-Type: application/json' -d '{"end_time": "2026-09-20T09:45:00Z"}'
+curl -X DELETE http://localhost:8000/invalid-periods/1
 ```
 
 ## 时间处理
@@ -354,7 +396,8 @@ curl 'http://localhost:8000/samples/sample-demo-001/logger-consistency/logger-tr
 容器启动（或本地 `init_db`）时会先幂等建表，再检测旧库缺失的列并以 `ALTER TABLE`
 补齐（暴露剂量配置/缓存列、告警方向与剂量列、告警的记录仪读数引用列
 `alerts.logger_reading_id`），并补建共享记录仪相关表
-（`loggers` / `logger_readings` / `logger_bindings` / `reading_attributions`）。
+（`loggers` / `logger_readings` / `logger_bindings` / `reading_attributions` /
+`logger_invalid_periods`）。
 旧版本的 SQLite 数据文件无需手工处理即可平滑升级，历史样本与读数保留，
 首次重算后剂量缓存自动填充。
 
@@ -373,4 +416,7 @@ pytest -q
 记录仪来源告警的去重与确认保留、样本/记录仪删除级联；一致性核查部分覆盖
 不交叉一对一配对的三级目标取舍（配对数最多、总时间差最小、读数 ID 序列稳定）、
 时间差边界与零窗口、温差严格超限判定、两侧未配对计数、迟到读数与绑定调整后的
-最新归属反映、核查只读不改写既有结果、参数校验（负值 422、缺失 422、不存在 404）。
+最新归属反映、核查只读不改写既有结果、参数校验（负值 422、缺失 422、不存在 404）；
+校准无效时段部分覆盖时段增删改查与重叠/倒挂/端点相接校验、时段内读数照常幂等入库
+但不归属样本且不参与冻融/剂量/告警/一致性核查、迟到读数与时段 PATCH/DELETE 后的
+归属对账与恢复、直接读数与既有告警确认状态保留、逐记录仪隔离与删除级联。

@@ -144,6 +144,22 @@ CREATE TABLE IF NOT EXISTS reading_attributions (
 
 CREATE INDEX IF NOT EXISTS idx_attributions_reading
     ON reading_attributions(logger_reading_id);
+
+-- 记录仪校准无效时段：落在时段内的记录仪读数仍照常幂等入库、可经原始读数
+-- 接口查询，但不归属任何样本，也不参与冻融循环、暴露剂量、告警与一致性核查。
+-- 时段为左闭右开 [start_time, end_time)；同一记录仪的时段不允许重叠
+-- （端点相接合法），重叠校验由 services 层的窗口查询完成。
+CREATE TABLE IF NOT EXISTS logger_invalid_periods (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    logger_id   TEXT NOT NULL REFERENCES loggers(id) ON DELETE CASCADE,
+    start_time  TEXT NOT NULL,
+    end_time    TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_invalid_periods_logger
+    ON logger_invalid_periods(logger_id, start_time, end_time);
 """
 
 

@@ -1252,3 +1252,323 @@ def test_consistency_validation(client) -> None:
     assert body["paired_count"] == 1
     assert body["unmatched_logger_count"] == 1
     assert body["anomalies"][0]["temperature_diff_c"] == 4.0
+
+
+# ---------------- 记录仪校准无效时段 ----------------
+
+
+def _add_invalid_period(client, lid, start, end):
+    return client.post(
+        f"/loggers/{lid}/invalid-periods",
+        json={"start_time": start, "end_time": end},
+    )
+
+
+def test_invalid_period_crud_and_validation(client) -> None:
+    _register_logger(client)
+
+    # 非法时段：零长度 / 倒挂
+    assert _add_invalid_period(
+        client, "lg1", "2026-09-20T10:00:00Z", "2026-09-20T10:00:00Z"
+    ).status_code == 422
+    assert _add_invalid_period(
+        client, "lg1", "2026-09-20T11:00:00Z", "2026-09-20T10:00:00Z"
+    ).status_code == 422
+
+    r = _add_invalid_period(client, "lg1", "2026-09-20T08:00:00Z", "2026-09-20T10:00:00Z")
+    assert r.status_code == 201, r.text
+    pid = r.json()["id"]
+    assert r.json()["logger_id"] == "lg1"
+    assert r.json()["start_time"].startswith("2026-09-20T08:00:00")
+
+    # 同一记录仪各种重叠均拒绝
+    for start, end in [
+        ("2026-09-20T09:00:00Z", "2026-09-20T11:00:00Z"),  # 跨越
+        ("2026-09-20T07:00:00Z", "2026-09-20T08:30:00Z"),  # 头交
+        ("2026-09-20T09:30:00Z", "2026-09-20T10:30:00Z"),  # 尾交
+        ("2026-09-20T08:30:00Z", "2026-09-20T09:30:00Z"),  # 包含
+    ]:
+        assert _add_invalid_period(client, "lg1", start, end).status_code == 422
+
+    # 端点相接（左闭右开）允许
+    assert _add_invalid_period(
+        client, "lg1", "2026-09-20T10:00:00Z", "2026-09-20T12:00:00Z"
+    ).status_code == 201
+    # 不同记录仪互不影响（同时段合法）
+    _register_logger(client, "lg2")
+    assert _add_invalid_period(
+        client, "lg2", "2026-09-20T08:00:00Z", "2026-09-20T10:00:00Z"
+    ).status_code == 201
+
+    # 列表与单条查询
+    periods = client.get("/loggers/lg1/invalid-periods").json()
+    assert [p["id"] for p in periods] == sorted(p["id"] for p in periods)
+    assert len(periods) == 2
+    assert periods[0]["logger_name"] == "记录仪 A"
+    assert periods[0]["reading_count"] == 0
+    assert client.get(f"/invalid-periods/{pid}").json()["id"] == pid
+
+    # 404：不存在的记录仪 / 时段
+    assert _add_invalid_period(
+        client, "nope", "2026-09-20T08:00:00Z", "2026-09-20T09:00:00Z"
+    ).status_code == 404
+    assert client.get("/loggers/nope/invalid-periods").status_code == 404
+    assert client.get("/invalid-periods/999").status_code == 404
+    assert client.patch(
+        "/invalid-periods/999", json={"end_time": "2026-09-20T12:00:00Z"}
+    ).status_code == 404
+    assert client.delete("/invalid-periods/999").status_code == 404
+
+    # PATCH：与现有另一端点合并后倒挂 422；与其他时段重叠 422；合法修改 200
+    assert client.patch(
+        f"/invalid-periods/{pid}", json={"start_time": "2026-09-20T11:00:00Z"}
+    ).status_code == 422
+    assert client.patch(
+        f"/invalid-periods/{pid}", json={"end_time": "2026-09-20T11:00:00Z"}
+    ).status_code == 422
+    r = client.patch(f"/invalid-periods/{pid}", json={"end_time": "2026-09-20T09:00:00Z"})
+    assert r.status_code == 200
+    assert r.json()["end_time"].startswith("2026-09-20T09:00:00")
+
+    # DELETE
+    assert client.delete(f"/invalid-periods/{pid}").status_code == 204
+    assert client.get(f"/invalid-periods/{pid}").status_code == 404
+    assert client.delete(f"/invalid-periods/{pid}").status_code == 404
+
+
+def test_invalid_period_readings_stored_but_not_attributed(client) -> None:
+    """落在无效时段的记录仪读数照常幂等入库、可经原始接口查询，但不归属样本。"""
+
+    _create_sample(client)
+    _register_logger(client)
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T12:00:00Z")
+    _logger_submit(client, "lg1", [
+        {"event_id": "g1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 4.0},
+        {"event_id": "g2", "event_time": "2026-09-20T08:30:00Z", "temperature_c": -25.0},
+        {"event_id": "g3", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 2.0},
+    ])
+    assert client.get("/samples/s1/state").json()["cycle_count"] == 1
+
+    # [08:30, 09:00) 标为校准无效：恰好覆盖 g2（左闭），不覆盖 g3（右开）-> 循环消失
+    r = _add_invalid_period(client, "lg1", "2026-09-20T08:30:00Z", "2026-09-20T09:00:00Z")
+    assert r.status_code == 201
+    assert client.get("/samples/s1/state").json()["cycle_count"] == 0
+
+    # 原始读数仍在、可查、幂等规则不变
+    rows = client.get("/loggers/lg1/readings").json()
+    assert [x["event_id"] for x in rows] == ["g1", "g2", "g3"]
+    dup = _logger_submit(client, "lg1", [
+        {"event_id": "g2", "event_time": "2026-09-20T08:30:00Z", "temperature_c": -25.0},
+    ])
+    assert dup.json()["duplicates"] == 1
+
+    # 归属中只剩 g1、g3；合并时间轴同样不含 g2
+    attributed = client.get("/samples/s1/readings?source=logger").json()
+    assert [x["event_id"] for x in attributed] == ["g1", "g3"]
+    merged = client.get("/samples/s1/readings").json()
+    assert [x["event_id"] for x in merged] == ["g1", "g3"]
+
+    # 绑定列表的归属计数同步排除无效读数
+    binding = client.get("/samples/s1/logger-bindings").json()[0]
+    assert binding["reading_count"] == 2
+    # 无效时段列表报告被排除的读数条数
+    period = client.get("/loggers/lg1/invalid-periods").json()[0]
+    assert period["reading_count"] == 1
+
+
+def test_invalid_period_excludes_from_dose_alerts_and_restore(client) -> None:
+    """无效时段读数不参与暴露剂量与告警；删除时段后恢复归属并回算。"""
+
+    _create_sample(client, min_allowed_c=-80, max_allowed_c=8)
+    _register_logger(client)
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T12:00:00Z")
+    # 0 -> 20 -> 0 °C：两段对称三角，热剂量 2 × (0.5 × 12 × 36) = 432；
+    # g2(20°C) 越上限产生一条记录仪越限告警
+    _logger_submit(client, "lg1", [
+        {"event_id": "g1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 0.0},
+        {"event_id": "g2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 20.0},
+        {"event_id": "g3", "event_time": "2026-09-20T10:00:00Z", "temperature_c": 0.0},
+    ])
+    state = client.get("/samples/s1/state").json()
+    assert state["heat_dose_c_min"] == 432.0
+    alerts = client.get("/alerts?sample_id=s1").json()
+    assert len(alerts) == 1 and alerts[0]["logger_reading_id"] is not None
+
+    # [08:30, 09:30) 无效：g2 排除 -> 时间轴剩 0 -> 0，剂量归零、告警撤销
+    pid = _add_invalid_period(
+        client, "lg1", "2026-09-20T08:30:00Z", "2026-09-20T09:30:00Z"
+    ).json()["id"]
+    state = client.get("/samples/s1/state").json()
+    assert state["heat_dose_c_min"] == 0.0
+    assert client.get("/alerts?sample_id=s1").json() == []
+
+    # PATCH 时段使其不再覆盖 g2 -> 归属恢复、剂量与告警回算
+    r = client.patch(f"/invalid-periods/{pid}", json={
+        "start_time": "2026-09-20T11:00:00Z",
+        "end_time": "2026-09-20T11:30:00Z",
+    })
+    assert r.status_code == 200
+    assert client.get("/samples/s1/state").json()["heat_dose_c_min"] == 432.0
+    assert len(client.get("/alerts?sample_id=s1").json()) == 1
+
+    # 重新覆盖 g2 后再删除时段 -> 有效读数恢复归属
+    client.patch(f"/invalid-periods/{pid}", json={
+        "start_time": "2026-09-20T08:30:00Z",
+        "end_time": "2026-09-20T09:30:00Z",
+    })
+    assert client.get("/samples/s1/state").json()["heat_dose_c_min"] == 0.0
+    assert client.delete(f"/invalid-periods/{pid}").status_code == 204
+    state = client.get("/samples/s1/state").json()
+    assert state["heat_dose_c_min"] == 432.0
+    assert [x["event_id"] for x in client.get("/samples/s1/readings?source=logger").json()] == [
+        "g1", "g2", "g3",
+    ]
+    # 告警按既有陈旧清理规则重新出现（新行、未确认）
+    alerts = client.get("/alerts?sample_id=s1").json()
+    assert len(alerts) == 1
+    assert alerts[0]["logger_reading_id"] is not None
+    assert alerts[0]["acknowledged"] is False
+
+
+def test_invalid_period_late_reading_and_delete_restores(client) -> None:
+    """补入落在无效时段的迟到读数：照常入库但不归属；删除时段后恢复归属。"""
+
+    _create_sample(client)
+    _register_logger(client)
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T12:00:00Z")
+    pid = _add_invalid_period(
+        client, "lg1", "2026-09-20T08:00:00Z", "2026-09-20T10:00:00Z"
+    ).json()["id"]
+
+    # 迟到读数落在无效时段：accepted=1、原始可查，但不归属、不参与推导
+    r = _logger_submit(client, "lg1", [
+        {"event_id": "late", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -25.0},
+    ])
+    assert r.json()["accepted"] == 1
+    assert len(client.get("/loggers/lg1/readings").json()) == 1
+    assert client.get("/samples/s1/readings?source=logger").json() == []
+    state = client.get("/samples/s1/state").json()
+    assert state["last_event_time"] is None
+    assert state["cycle_count"] == 0
+
+    # 再补一条窗口内、无效时段外的解冻读数：仍只有它归属
+    _logger_submit(client, "lg1", [
+        {"event_id": "ok", "event_time": "2026-09-20T10:30:00Z", "temperature_c": 2.0},
+    ])
+    assert [x["event_id"] for x in client.get("/samples/s1/readings?source=logger").json()] == ["ok"]
+    assert client.get("/samples/s1/state").json()["cycle_count"] == 0
+
+    # 删除无效时段：late 恢复归属 -> 冻结(09:00) + 解冻(10:30) 闭环一次循环
+    assert client.delete(f"/invalid-periods/{pid}").status_code == 204
+    assert [x["event_id"] for x in client.get("/samples/s1/readings?source=logger").json()] == [
+        "late", "ok",
+    ]
+    assert client.get("/samples/s1/state").json()["cycle_count"] == 1
+
+
+def test_invalid_period_preserves_direct_readings_and_ack(client) -> None:
+    """无效时段回算不改动直接读数；既有告警确认状态按现有规则保留。"""
+
+    _create_sample(client, min_allowed_c=-80, max_allowed_c=8)
+    _register_logger(client)
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T12:00:00Z")
+    # 直接读数越限并确认其告警
+    client.post("/samples/s1/readings", json={"readings": [
+        {"event_id": "d1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": -85.0},
+        {"event_id": "d2", "event_time": "2026-09-20T08:30:00Z", "temperature_c": 2.0},
+    ]})
+    alert = client.get("/alerts?sample_id=s1").json()[0]
+    assert alert["reading_id"] is not None
+    client.post(f"/alerts/{alert['id']}/ack", json={"acknowledged": True})
+
+    # 记录仪读数也产生一条越限告警
+    _logger_submit(client, "lg1", [
+        {"event_id": "g1", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -90.0},
+    ])
+    assert len(client.get("/alerts?sample_id=s1").json()) == 2
+
+    # 无效时段覆盖 g1：记录仪告警撤销；直接读数告警 id 与确认状态保留
+    pid = _add_invalid_period(
+        client, "lg1", "2026-09-20T08:45:00Z", "2026-09-20T09:15:00Z"
+    ).json()["id"]
+    alerts = client.get("/alerts?sample_id=s1").json()
+    assert len(alerts) == 1
+    assert alerts[0]["id"] == alert["id"]
+    assert alerts[0]["acknowledged"] is True
+    # 直接读数本身不变
+    direct = client.get("/samples/s1/readings?source=direct").json()
+    assert [x["event_id"] for x in direct] == ["d1", "d2"]
+
+    # 删除时段：记录仪告警按既有规则重新出现，直接读数告警确认仍保留
+    client.delete(f"/invalid-periods/{pid}")
+    alerts = client.get("/alerts?sample_id=s1").json()
+    assert len(alerts) == 2
+    direct_alert = next(a for a in alerts if a["reading_id"] is not None)
+    assert direct_alert["id"] == alert["id"]
+    assert direct_alert["acknowledged"] is True
+
+
+def test_invalid_period_excluded_from_consistency(client) -> None:
+    """一致性核查只使用当前有效归属：无效时段读数不参与配对。"""
+
+    _create_sample(client)
+    _register_logger(client)
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T12:00:00Z")
+    client.post("/samples/s1/readings", json={"readings": [
+        {"event_id": "d1", "event_time": "2026-09-20T08:00:00Z", "temperature_c": 0.0},
+        {"event_id": "d2", "event_time": "2026-09-20T09:00:00Z", "temperature_c": 0.0},
+    ]})
+    _logger_submit(client, "lg1", [
+        {"event_id": "g1", "event_time": "2026-09-20T08:01:00Z", "temperature_c": 0.0},
+        {"event_id": "g2", "event_time": "2026-09-20T09:01:00Z", "temperature_c": 0.0},
+    ])
+    body = _consistency(client, "s1", "lg1", 300, 1.0).json()
+    assert body["paired_count"] == 2
+
+    # g1 落入无效时段 -> 只剩一对，g1 不再计入未配对（已不属于有效归属）
+    pid = _add_invalid_period(
+        client, "lg1", "2026-09-20T08:00:00Z", "2026-09-20T08:30:00Z"
+    ).json()["id"]
+    body = _consistency(client, "s1", "lg1", 300, 1.0).json()
+    assert body["paired_count"] == 1
+    assert body["unmatched_sample_count"] == 1
+    assert body["unmatched_logger_count"] == 0
+
+    # 删除时段后恢复
+    client.delete(f"/invalid-periods/{pid}")
+    body = _consistency(client, "s1", "lg1", 300, 1.0).json()
+    assert body["paired_count"] == 2
+    assert body["unmatched_sample_count"] == 0
+    assert body["unmatched_logger_count"] == 0
+
+
+def test_invalid_period_is_per_logger_and_cascades(client) -> None:
+    """无效时段只影响所属记录仪；删除记录仪级联清理其无效时段。"""
+
+    _create_sample(client)
+    _register_logger(client, "lg1")
+    _register_logger(client, "lg2")
+    # 同一样本的绑定时段不得重叠（跨记录仪亦然）：两台记录仪各管一段
+    _bind(client, "s1", "lg1", "2026-09-20T08:00:00Z", "2026-09-20T10:00:00Z")
+    _bind(client, "s1", "lg2", "2026-09-20T10:00:00Z", "2026-09-20T12:00:00Z")
+    _logger_submit(client, "lg1", [
+        {"event_id": "a1", "event_time": "2026-09-20T09:00:00Z", "temperature_c": -25.0},
+    ])
+    _logger_submit(client, "lg2", [
+        {"event_id": "b1", "event_time": "2026-09-20T11:00:00Z", "temperature_c": -25.0},
+    ])
+    assert len(client.get("/samples/s1/readings?source=logger").json()) == 2
+
+    # lg1 的无效时段只排除 lg1 的读数
+    _add_invalid_period(client, "lg1", "2026-09-20T08:00:00Z", "2026-09-20T10:00:00Z")
+    rows = client.get("/samples/s1/readings?source=logger").json()
+    assert [x["event_id"] for x in rows] == ["b1"]
+    # lg1 原始读数仍在
+    assert len(client.get("/loggers/lg1/readings").json()) == 1
+
+    # 删除记录仪：级联清理无效时段；重新登记同名记录仪后时段列表为空
+    assert client.delete("/loggers/lg1").status_code == 204
+    _register_logger(client, "lg1")
+    assert client.get("/loggers/lg1/invalid-periods").json() == []
+    # lg2 的归属不受影响
+    assert [x["event_id"] for x in client.get("/samples/s1/readings?source=logger").json()] == ["b1"]

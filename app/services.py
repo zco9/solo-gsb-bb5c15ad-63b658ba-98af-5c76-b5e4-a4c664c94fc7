@@ -5,6 +5,12 @@
 重算时把直接读数与归属的记录仪读数合并到同一条时间轴上喂给引擎；
 绑定时段变更或迟到记录仪读数到达时，先对账归属（删除失效、补建新属），
 再整体重算受影响样本，因此不会留下重复派生读数，且直接读数从不被改动。
+
+记录仪校准无效时段（``logger_invalid_periods``）：落在时段内的记录仪读数
+照常幂等入库、可经原始读数接口查询，但对账时一律不归属样本，
+从而不参与冻融循环、暴露剂量、告警与温度一致性核查；
+时段的新增 / 修改 / 删除都会对绑定该记录仪的样本重新对账并回算，
+删除时段后有效读数恢复归属。
 """
 
 from __future__ import annotations
@@ -780,6 +786,8 @@ def reconcile_sample(
     左闭右开：``start_time <= event_time < end_time`` 才归入。
     同一样本各绑定时段不重叠，故一条记录仪读数至多归属一次，
     对账删除失效归属、补建新归属，不会产生重复派生读数。
+    落在记录仪**校准无效时段**内的读数不归属任何样本
+    （原始读数仍在 ``logger_readings`` 中，可经原始读数接口查询）。
     本函数只重建归属表；循环/告警由调用方随后 ``recompute`` 完成。
     """
 
@@ -795,6 +803,12 @@ def reconcile_sample(
                   WHERE b.sample_id = ?
                     AND lr.event_time >= b.start_time
                     AND lr.event_time < b.end_time
+                    AND NOT EXISTS (
+                        SELECT 1 FROM logger_invalid_periods p
+                        WHERE p.logger_id = lr.logger_id
+                          AND lr.event_time >= p.start_time
+                          AND lr.event_time < p.end_time
+                    )
               )
             """,
             (sample_id, sample_id),
@@ -808,6 +822,12 @@ def reconcile_sample(
             WHERE b.sample_id = ?
               AND lr.event_time >= b.start_time
               AND lr.event_time < b.end_time
+              AND NOT EXISTS (
+                  SELECT 1 FROM logger_invalid_periods p
+                  WHERE p.logger_id = lr.logger_id
+                    AND lr.event_time >= p.start_time
+                    AND lr.event_time < p.end_time
+              )
             """,
             (sample_id, sample_id),
         )
@@ -974,6 +994,168 @@ def delete_binding(conn: sqlite3.Connection, binding_id: int) -> bool:
         conn.commit()
         reconcile_sample(conn, sample_id, lock_held=True)
         recompute(conn, sample_id, lock_held=True)
+    return True
+
+
+# ---- 校准无效时段 ----
+
+
+def _find_invalid_period_overlap(
+    conn: sqlite3.Connection,
+    logger_id: str,
+    start_iso: str,
+    end_iso: str,
+    exclude_period_id: Optional[int] = None,
+) -> Optional[sqlite3.Row]:
+    """返回与左闭右开时段 [start, end) 重叠的同一记录仪既有无效时段（不含自身）。"""
+
+    sql = (
+        "SELECT * FROM logger_invalid_periods WHERE logger_id = ? "
+        "AND start_time < ? AND end_time > ?"
+    )
+    params: list = [logger_id, end_iso, start_iso]
+    if exclude_period_id is not None:
+        sql += " AND id <> ?"
+        params.append(exclude_period_id)
+    return conn.execute(sql, params).fetchone()
+
+
+def _rebuild_samples_bound_to_logger(conn: sqlite3.Connection, logger_id: str) -> None:
+    """对账并重算绑定到该记录仪的全部样本（校准无效时段变更后调用）。
+
+    调用方须已持有 ``_write_lock``。
+    """
+
+    for sample_id in samples_bound_to_logger(conn, logger_id):
+        reconcile_sample(conn, sample_id, lock_held=True)
+        recompute(conn, sample_id, lock_held=True)
+
+
+def list_invalid_periods(
+    conn: sqlite3.Connection, logger_id: str
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT p.*, l.name AS logger_name,
+               (SELECT COUNT(*) FROM logger_readings lr
+                 WHERE lr.logger_id = p.logger_id
+                   AND lr.event_time >= p.start_time
+                   AND lr.event_time < p.end_time) AS reading_count
+        FROM logger_invalid_periods p
+        JOIN loggers l ON l.id = p.logger_id
+        WHERE p.logger_id = ?
+        ORDER BY p.start_time, p.id
+        """,
+        (logger_id,),
+    ).fetchall()
+    return list(rows)
+
+
+def get_invalid_period(
+    conn: sqlite3.Connection, period_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM logger_invalid_periods WHERE id = ?", (period_id,)
+    ).fetchone()
+
+
+def create_invalid_period(
+    conn: sqlite3.Connection,
+    logger_id: str,
+    start_time: datetime,
+    end_time: datetime,
+) -> sqlite3.Row:
+    """新增记录仪校准无效时段；同一记录仪时段重叠拒绝。
+
+    落库后对所有绑定该记录仪的样本做归属对账并重算：
+    时段内的记录仪读数不再归属样本（原始读数保留）。
+    """
+
+    start_iso = to_utc_iso(start_time)
+    end_iso = to_utc_iso(end_time)
+    if end_iso <= start_iso:
+        raise ValidationError("end_time 必须严格晚于 start_time（左闭右开时段）")
+
+    with _write_lock:
+        overlap = _find_invalid_period_overlap(conn, logger_id, start_iso, end_iso)
+        if overlap is not None:
+            raise ValidationError(
+                f"校准无效时段与现有时段重叠：period_id={overlap['id']} "
+                f"[{overlap['start_time']}, {overlap['end_time']})"
+            )
+        now = utcnow_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO logger_invalid_periods (logger_id, start_time, end_time, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (logger_id, start_iso, end_iso, now, now),
+        )
+        period_id = cur.lastrowid
+        conn.commit()
+        _rebuild_samples_bound_to_logger(conn, logger_id)
+
+    row = get_invalid_period(conn, period_id)
+    assert row is not None
+    return row
+
+
+def update_invalid_period(
+    conn: sqlite3.Connection,
+    period_id: int,
+    changes: dict,
+) -> sqlite3.Row:
+    """PATCH 校准无效时段：校验不重叠，然后对账并重算受影响样本。"""
+
+    period = get_invalid_period(conn, period_id)
+    if period is None:
+        raise KeyError(period_id)
+
+    # 仅提交单个端点时与另一个现有端点合并后再校验，避免出现倒挂时段
+    start_iso = (
+        to_utc_iso(changes["start_time"])
+        if changes.get("start_time") is not None
+        else period["start_time"]
+    )
+    end_iso = (
+        to_utc_iso(changes["end_time"])
+        if changes.get("end_time") is not None
+        else period["end_time"]
+    )
+    if end_iso <= start_iso:
+        raise ValidationError("end_time 必须严格晚于 start_time（左闭右开时段）")
+
+    with _write_lock:
+        overlap = _find_invalid_period_overlap(
+            conn, period["logger_id"], start_iso, end_iso, exclude_period_id=period_id
+        )
+        if overlap is not None:
+            raise ValidationError(
+                f"校准无效时段与现有时段重叠：period_id={overlap['id']} "
+                f"[{overlap['start_time']}, {overlap['end_time']})"
+            )
+        conn.execute(
+            "UPDATE logger_invalid_periods SET start_time = ?, end_time = ?, updated_at = ? WHERE id = ?",
+            (start_iso, end_iso, utcnow_iso(), period_id),
+        )
+        conn.commit()
+        _rebuild_samples_bound_to_logger(conn, period["logger_id"])
+
+    row = get_invalid_period(conn, period_id)
+    assert row is not None
+    return row
+
+
+def delete_invalid_period(conn: sqlite3.Connection, period_id: int) -> bool:
+    """删除校准无效时段：原时段内的有效读数恢复归属，受影响样本重算。"""
+
+    period = get_invalid_period(conn, period_id)
+    if period is None:
+        return False
+    with _write_lock:
+        conn.execute("DELETE FROM logger_invalid_periods WHERE id = ?", (period_id,))
+        conn.commit()
+        _rebuild_samples_bound_to_logger(conn, period["logger_id"])
     return True
 
 
