@@ -88,3 +88,17 @@ curl -sS -X POST "$BASE/samples/$SID/logger-bindings?logger_id=logger-truck-07" 
 
 echo "== 样本 × 记录仪温度一致性核查（最大时间差 300 秒、温差阈值 2°C；只读）=="
 curl -sS "$BASE/samples/$SID/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0"; echo
+
+echo "== 登记校准无效时段（左闭右开 [09:00, 10:00)）：时段内读数仍入库可查，但不归属样本 =="
+curl -sS -X POST "$BASE/loggers/logger-truck-07/invalid-periods" \
+  -H 'Content-Type: application/json' \
+  -d '{"start_time": "2026-09-20T09:00:00Z", "end_time": "2026-09-20T10:00:00Z"}'; echo
+
+echo "== 无效时段列表与样本当前状态（时段内记录仪读数不参与派生计算）=="
+curl -sS "$BASE/loggers/logger-truck-07/invalid-periods"; echo
+curl -sS "$BASE/samples/$SID/state"; echo
+
+echo "== 删除无效时段（有效读数恢复归属并重算）=="
+PID=$(curl -sS "$BASE/loggers/logger-truck-07/invalid-periods" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')
+curl -sS -X DELETE "$BASE/invalid-periods/$PID"; echo
+curl -sS "$BASE/samples/$SID/state"; echo

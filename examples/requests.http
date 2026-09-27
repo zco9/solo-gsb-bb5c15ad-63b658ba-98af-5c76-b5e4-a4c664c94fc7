@@ -122,3 +122,26 @@ Content-Type: application/json
 
 ### 15. 样本 × 记录仪温度一致性核查（最大时间差 300 秒、温差阈值 2°C；只读）
 GET {{baseUrl}}/samples/{{sampleId}}/logger-consistency/logger-truck-07?max_time_diff_seconds=300&temp_diff_threshold_c=2.0
+
+### 16. 登记校准无效时段（左闭右开 [09:00, 10:00)；同一记录仪时段不得重叠）
+###     落在时段内的记录仪读数仍幂等入库、可从原始读数接口查询，
+###     但不归属样本，不参与冻融循环/暴露剂量/告警/一致性核查
+POST {{baseUrl}}/loggers/logger-truck-07/invalid-periods
+Content-Type: application/json
+
+{"start_time": "2026-09-20T09:00:00Z", "end_time": "2026-09-20T10:00:00Z"}
+
+### 17. 查询该记录仪的无效时段列表 / 单条详情
+GET {{baseUrl}}/loggers/logger-truck-07/invalid-periods
+
+###
+GET {{baseUrl}}/invalid-periods/1
+
+### 18. 修改无效时段（只改一端时与另一端合并校验；重叠返回 422）
+PATCH {{baseUrl}}/invalid-periods/1
+Content-Type: application/json
+
+{"end_time": "2026-09-20T09:30:00Z"}
+
+### 19. 删除无效时段（原本被排除的有效读数恢复归属并重算受影响样本）
+DELETE {{baseUrl}}/invalid-periods/1

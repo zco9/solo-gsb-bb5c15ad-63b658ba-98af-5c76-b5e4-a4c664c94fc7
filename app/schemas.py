@@ -144,6 +144,30 @@ class LoggerBindingUpdate(BaseModel):
         return self
 
 
+class InvalidPeriodIn(BaseModel):
+    start_time: datetime = Field(..., description="无效时段起点（含，左闭；ISO 8601，无时区按 UTC 处理）")
+    end_time: datetime = Field(..., description="无效时段终点（不含，右开）")
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time 必须严格晚于 start_time（左闭右开时段）")
+        return self
+
+
+class InvalidPeriodUpdate(BaseModel):
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def _validate(self):
+        start = self.start_time
+        end = self.end_time
+        if start is not None and end is not None and end <= start:
+            raise ValueError("end_time 必须严格晚于 start_time（左闭右开时段）")
+        return self
+
+
 class AckRequest(BaseModel):
     acknowledged: bool = True
 
@@ -226,6 +250,17 @@ class LoggerBindingOut(BaseModel):
     logger_name: Optional[str] = None
     # 该时段当前归入的记录仪读数条数
     reading_count: Optional[int] = None
+
+
+class InvalidPeriodOut(BaseModel):
+    model_config = {"from_attributes": True}
+
+    id: int
+    logger_id: str
+    start_time: datetime
+    end_time: datetime
+    created_at: datetime
+    updated_at: datetime
 
 
 class CycleOut(BaseModel):
